@@ -9,12 +9,15 @@ bound (which would eventually crash a naive reader):
   * `<parkId>.json`         — ROLLING raw window (default 30 days) at the
                               run cadence. Bounded → the app fetches one
                               small file per park, never a giant blob.
-  * `<parkId>.summary.json` — per-ride, per-UTC-day {min, max, avg, count}
-                              kept **forever**. Tiny (a year is a few
-                              hundred KB) and never trimmed, so the
-                              long-range historical signal only ever gets
-                              richer. Days still inside the raw window are
-                              recomputed each run; older days are frozen.
+  * `<parkId>.summary.json` — per-ride, per-UTC-day [min, max, avg, count],
+                              plus [down, closed] appended on days the ride
+                              broke down (DOWN) or was closed during park
+                              hours (CLOSED / REFURBISHMENT). Kept
+                              **forever**. Tiny (a year is a few hundred KB)
+                              and never trimmed, so the long-range historical
+                              signal only ever gets richer. Days still inside
+                              the raw window are recomputed each run; older
+                              days are frozen.
 
 Runs on a GitHub Actions cron (hourly by default). Discovers all parks
 from `/destinations` unless `parks.json` pins an allowlist. Standard
@@ -69,21 +72,58 @@ def discover_parks(allowlist: list[dict]) -> list[dict]:
     return parks
 
 
-def operating_waits(live: dict) -> dict:
-    """`{attractionId: waitMinutes}` for rides/shows that are OPERATING with
-    a plausible standby wait. Closed / no-data rides are omitted (they read
-    as gaps in the chart) — that keeps the raw file small and the DB clean."""
-    out: dict[str, int] = {}
+def classify(live: dict) -> tuple[dict[str, int], list[str], list[str]]:
+    """Split a park's live feed into three buckets:
+
+      * `waits`  — `{attractionId: waitMinutes}` for OPERATING rides/shows
+                   with a plausible standby wait.
+      * `down`   — ids of rides that are **DOWN** (a breakdown — broke and
+                   can't be ridden).
+      * `closed` — ids of rides that are **CLOSED** or under
+                   **REFURBISHMENT** (not rideable).
+
+    The caller only records a park when `waits` is non-empty (i.e. the park
+    is open), so every `down` / `closed` id is a ride that broke down or was
+    closed *during the park's opening hours* — never the overnight
+    all-closed state, which is skipped entirely."""
+    waits: dict[str, int] = {}
+    down: list[str] = []
+    closed: list[str] = []
     for item in live.get("liveData", []) or []:
         if (item.get("entityType") or "").upper() not in _KINDS:
             continue
         rid = item.get("id")
-        if not rid or (item.get("status") or "").upper() != "OPERATING":
+        if not rid:
             continue
-        standby = (item.get("queue") or {}).get("STANDBY") or {}
-        w = standby.get("waitTime")
-        if isinstance(w, int) and 0 <= w <= _MAX_WAIT:
-            out[rid] = w
+        status = (item.get("status") or "").upper()
+        if status == "OPERATING":
+            standby = (item.get("queue") or {}).get("STANDBY") or {}
+            w = standby.get("waitTime")
+            if isinstance(w, int) and 0 <= w <= _MAX_WAIT:
+                waits[rid] = w
+        elif status == "DOWN":
+            down.append(rid)
+        elif status in ("CLOSED", "REFURBISHMENT"):
+            closed.append(rid)
+    return waits, down, closed
+
+
+def _agg_tuple(day_ride: dict) -> list[int]:
+    """One ride's daily aggregate: `[min, max, avg, count]` over its
+    OPERATING samples, with `[down, closed]` appended **only** when the ride
+    broke down or was closed that day. Keeping the common all-operating case
+    a 4-tuple stays byte-compatible with readers that index 0..3 (the mobile
+    app) and keeps the forever-summary small."""
+    ws = day_ride["w"]
+    if ws:
+        out = [min(ws), max(ws), round(sum(ws) / len(ws)), len(ws)]
+    else:
+        # Ride never operated this day (down / closed all day): no wait
+        # stats, but we still emit an entry so the break shows up.
+        out = [0, 0, 0, 0]
+    down, closed = day_ride["down"], day_ride["closed"]
+    if down or closed:
+        out += [down, closed]
     return out
 
 
@@ -109,7 +149,7 @@ def record_park(data_dir: str, park: dict, now: int, cutoff: int,
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
         print(f"WARN {pname} ({pid}): fetch failed: {exc}", file=sys.stderr)
         return None
-    waits = operating_waits(live)
+    waits, down, closed = classify(live)
     if not waits:
         return None  # park closed / no live data right now — skip quietly
 
@@ -120,7 +160,14 @@ def record_park(data_dir: str, park: dict, now: int, cutoff: int,
         s for s in raw.get("samples", [])
         if isinstance(s, dict) and isinstance(s.get("t"), int) and s["t"] >= cutoff
     ]
-    samples.append({"t": now, "r": waits})
+    sample: dict = {"t": now, "r": waits}
+    # Only attach the down / closed lists when non-empty so a normal
+    # everything-running sample stays as small as before.
+    if down:
+        sample["d"] = down
+    if closed:
+        sample["c"] = closed
+    samples.append(sample)
     with open(raw_path, "w", encoding="utf-8") as fh:
         json.dump({
             "p": pid, "name": pname, "generatedAt": now_iso,
@@ -133,12 +180,22 @@ def record_park(data_dir: str, park: dict, now: int, cutoff: int,
     # frozen (never recomputed, never dropped).
     sum_path = os.path.join(data_dir, f"{pid}.summary.json")
     summary = _load(sum_path) or {"p": pid, "days": {}}
-    by_day: dict[str, dict[str, list[int]]] = {}
+    # day -> rid -> {"w": [waits], "down": n, "closed": n}
+    by_day: dict[str, dict[str, dict]] = {}
+
+    def _slot(day: str, rid: str) -> dict:
+        return by_day.setdefault(day, {}).setdefault(
+            rid, {"w": [], "down": 0, "closed": 0})
+
     for s in samples:
         day = _utc_day(s["t"])
         for rid, w in s.get("r", {}).items():
             if isinstance(w, int):
-                by_day.setdefault(day, {}).setdefault(rid, []).append(w)
+                _slot(day, rid)["w"].append(w)
+        for rid in s.get("d", []) or []:
+            _slot(day, rid)["down"] += 1
+        for rid in s.get("c", []) or []:
+            _slot(day, rid)["closed"] += 1
     # CRITICAL: only (re)write a day's aggregate while ALL of that day's
     # samples are still in the raw window (1-day safety margin). Otherwise
     # a day that's mid-way through being trimmed would overwrite its
@@ -152,8 +209,7 @@ def record_park(data_dir: str, park: dict, now: int, cutoff: int,
         if day_start < safe:
             continue  # boundary / already-frozen day — never recompute
         summary["days"][day] = {
-            rid: [min(ws), max(ws), round(sum(ws) / len(ws)), len(ws)]
-            for rid, ws in rides.items()
+            rid: _agg_tuple(d) for rid, d in rides.items()
         }
     summary["p"] = pid
     summary["name"] = pname
