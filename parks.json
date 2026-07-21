@@ -1,0 +1,4 @@
+{
+  "_comment": "OPTIONAL allowlist. Leave 'parks' EMPTY to record EVERY themeparks.wiki park automatically (the default — recommended). To restrict to specific parks (fewer API calls per run), add {\"id\": \"<themeparks.wiki entity id>\", \"name\": \"...\"} entries; ids are at https://api.themeparks.wiki/v1/destinations.",
+  "parks": []
+}

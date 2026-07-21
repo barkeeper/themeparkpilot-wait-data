@@ -1,0 +1,52 @@
+name: wait-history
+
+# Free ($0) historical wait-time recorder for every themeparks.wiki park.
+# Runs in THIS public repo so Actions minutes are unlimited (private repos
+# have a monthly cap), and commits the data to itself — the mobile app +
+# admin read it over raw.githubusercontent. GitHub Actions + this repo is
+# the whole "server": no backend, no database.
+#
+# Hourly. Two tiers per park (see ingest.py):
+#   data/wait-history/<parkId>.json          — 30-day rolling raw window
+#   data/wait-history/<parkId>.summary.json  — forever daily min/max/avg
+# Incremental commits (Git delta-compresses the ~99%-unchanged files).
+# GitHub disables cron after 60 days of no commits — hourly runs keep it
+# alive on their own.
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wait-history
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Record samples for every park
+        run: |
+          mkdir -p data/wait-history
+          python ingest.py --data-dir data/wait-history --window-days 30 --workers 8
+
+      - name: Commit + push
+        run: |
+          git config user.name "wait-history-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "No data changes to publish."
+            exit 0
+          fi
+          git commit -q -m "wait history $(date -u +%FT%TZ) [run ${{ github.run_number }}]"
+          git push
