@@ -107,6 +107,14 @@ STORE_RAW = os.environ.get("STORE_RAW", "1") not in ("0", "false", "no")
 # "broken" or "the park is shut".
 SCHEDULE_INTERVAL_S = int(os.environ.get("SCHEDULE_INTERVAL_S", "86400"))
 
+# Consistent on-line snapshots of the archive. SQLite's VACUUM INTO takes
+# a correct copy while writes continue, so this needs no downtime. The
+# live DB is a single file: without a second copy, one bad sector or one
+# mistaken `rm` is the entire history. Kept for BACKUP_KEEP days.
+BACKUP_INTERVAL_S = int(os.environ.get("BACKUP_INTERVAL_S", "86400"))
+BACKUP_KEEP = int(os.environ.get("BACKUP_KEEP", "7"))
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/data/backups")
+
 # How often to regenerate + push the app-facing JSON.
 PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "900"))
 PUBLISH_WINDOW_DAYS = int(os.environ.get("PUBLISH_WINDOW_DAYS", "7"))
@@ -331,6 +339,33 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
     )
 
 
+def backup(db: sqlite3.Connection) -> None:
+    """Point-in-time snapshot via VACUUM INTO — consistent even mid-write.
+
+    Deliberately a separate FILE rather than a copy of the live one: a
+    half-copied SQLite database looks fine until the day you need it.
+    """
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    dest = os.path.join(BACKUP_DIR, f"wait_history-{stamp}.db")
+    if os.path.exists(dest):
+        return
+    try:
+        db.execute("VACUUM INTO ?", (dest,))
+        log(f"backup -> {dest} ({os.path.getsize(dest)/1024/1024:.1f} MB)")
+    except sqlite3.Error as exc:
+        log(f"  ! backup failed: {exc}")
+        return
+    # Prune, oldest first. Never touches the live DB.
+    snaps = sorted(f for f in os.listdir(BACKUP_DIR)
+                   if f.startswith("wait_history-") and f.endswith(".db"))
+    for old in snaps[:-BACKUP_KEEP] if len(snaps) > BACKUP_KEEP else []:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, old))
+        except OSError:
+            pass
+
+
 def poll_schedule(db: sqlite3.Connection, pid: str, etag: str | None) -> None:
     """Park opening hours. One request per park per day.
 
@@ -485,6 +520,22 @@ def publish(db: sqlite3.Connection) -> None:
                    "windowDays": PUBLISH_WINDOW_DAYS,
                    "parks": index}, fh, separators=(",", ":"))
 
+    # Also expose everything under a `wait-history/` subdirectory.
+    #
+    # Reverse proxies are split on whether `proxy_pass http://host:8095`
+    # (no trailing slash) forwards `/wait-history/index.json` verbatim or
+    # strips the prefix first. Getting that wrong is the single most
+    # common way this setup 404s. Serving the same files at BOTH `/` and
+    # `/wait-history/` makes either proxy config work, for the cost of
+    # ~180 KB of duplication -- far cheaper than a support round-trip.
+    mirror = os.path.join(out_dir, "wait-history")
+    os.makedirs(mirror, exist_ok=True)
+    for fname in os.listdir(out_dir):
+        if not fname.endswith(".json"):
+            continue
+        with open(os.path.join(out_dir, fname), "rb") as src,              open(os.path.join(mirror, fname), "wb") as dst:
+            dst.write(src.read())
+
     # Optional git mirror. Skipped entirely when GIT_REMOTE is empty, so a
     # fully self-hosted setup never touches GitHub.
     if not GIT_REMOTE or not os.path.isdir(os.path.join(REPO_DIR, ".git")):
@@ -525,6 +576,7 @@ def main() -> int:
     db = connect()
     refresh_park_list(db)
     last_publish = 0.0
+    last_backup = 0.0
     last_park_refresh = time.monotonic()
 
     while not _stop.is_set():
@@ -555,6 +607,10 @@ def main() -> int:
                 log(f"  ! publish failed: {exc}")  # take down collection
             last_publish = time.monotonic()
 
+        if time.monotonic() - last_backup > BACKUP_INTERVAL_S:
+            backup(db)
+            last_backup = time.monotonic()
+
         if time.monotonic() - last_park_refresh > 86400:
             refresh_park_list(db)
             last_park_refresh = time.monotonic()
@@ -563,7 +619,15 @@ def main() -> int:
 
     log("shutting down")
     db.commit()
+    # Fold the write-ahead log back into the main file so the archive is a
+    # single self-contained database at rest, rather than one that depends
+    # on a -wal sidecar surviving alongside it.
+    try:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass
     db.close()
+    log("archive closed cleanly")
     return 0
 
 
