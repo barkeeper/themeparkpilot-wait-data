@@ -243,10 +243,32 @@ CREATE TABLE IF NOT EXISTS schedules (
 """
 
 
+# Columns added to `parks` after the first release. `CREATE TABLE IF NOT
+# EXISTS` does NOT alter an existing table, so a database created by an
+# older build keeps its old shape and every query against a new column
+# raises `no such column` -- which crash-loops the container. Fresh-install
+# testing never catches this; upgrades always hit it.
+_PARK_COLUMNS = {
+    "sched_at": "INTEGER DEFAULT 0",
+    "sched_etag": "TEXT",
+}
+
+
+def migrate(db: sqlite3.Connection) -> None:
+    """Adds any column missing from an older `parks` table. Idempotent."""
+    have = {r[1] for r in db.execute("PRAGMA table_info(parks)")}
+    for col, decl in _PARK_COLUMNS.items():
+        if col not in have:
+            db.execute(f"ALTER TABLE parks ADD COLUMN {col} {decl}")
+            log(f"migrated: parks.{col} added")
+    db.commit()
+
+
 def connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=30)
     db.executescript(SCHEMA)
+    migrate(db)
     # WAL: the publisher reads while the poller writes.
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
