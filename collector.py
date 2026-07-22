@@ -10,10 +10,12 @@ when it says it will, so the win here is not a higher ceiling — it is
 
   * **SQLite (`/data/wait_history.db`)** — the truth. Every poll, every
     change, kept forever at full fidelity. This is yours; nothing trims it.
-  * **Published JSON (git → the public data repo)** — a small derived view
-    the mobile app reads over raw.githubusercontent. Stays a 7-day window
-    plus the forever daily summary, because that is all the app draws and
-    every byte is downloaded by every user on every park open.
+  * **Published JSON (`PUBLISH_DIR`)** — a small derived view the app
+    reads: a 7-day window plus the forever daily summary, because that is
+    all the app draws and every byte is downloaded by every user on every
+    park open. A plain static directory, so any web server can serve it
+    straight off the array. Mirroring it to git is optional and off by
+    default.
 
 Truth is local and unlimited; the published copy stays lean. Regenerating
 the JSON from SQLite means the two can never disagree.
@@ -63,6 +65,13 @@ CONTACT = os.environ.get("CONTACT_URL", "https://github.com/barkeeper")
 UA = f"themeparkpilot-wait-history/3.0 (+{CONTACT}; self-hosted collector)"
 
 DB_PATH = os.environ.get("DB_PATH", "/data/wait_history.db")
+
+# Where the derived, app-facing JSON is written. This is now the PRIMARY
+# output: a static directory any web server can serve straight off the
+# array. Publishing to git is an optional extra on top, not the mechanism.
+PUBLISH_DIR = os.environ.get("PUBLISH_DIR", "/data/published")
+
+# Optional git mirror. Leave GIT_REMOTE empty to skip GitHub entirely.
 REPO_DIR = os.environ.get("REPO_DIR", "/data/repo")
 DATA_SUBDIR = os.environ.get("DATA_SUBDIR", "data/wait-history")
 
@@ -315,9 +324,9 @@ def publish(db: sqlite3.Connection) -> None:
     Derived from SQLite rather than accumulated separately, so the
     published view can never drift from the archive of record.
     """
-    if not GIT_REMOTE or not os.path.isdir(os.path.join(REPO_DIR, ".git")):
-        return
-    out_dir = os.path.join(REPO_DIR, DATA_SUBDIR)
+    # Always write the static directory. This is what the app reads when
+    # it is pointed at your own server; git is only a mirror.
+    out_dir = PUBLISH_DIR
     os.makedirs(out_dir, exist_ok=True)
     now = int(time.time())
     cutoff = now - PUBLISH_WINDOW_DAYS * 86400
@@ -390,6 +399,17 @@ def publish(db: sqlite3.Connection) -> None:
                    "windowDays": PUBLISH_WINDOW_DAYS,
                    "parks": index}, fh, separators=(",", ":"))
 
+    # Optional git mirror. Skipped entirely when GIT_REMOTE is empty, so a
+    # fully self-hosted setup never touches GitHub.
+    if not GIT_REMOTE or not os.path.isdir(os.path.join(REPO_DIR, ".git")):
+        log(f"published {len(index)} parks -> {out_dir}")
+        return
+    repo_out = os.path.join(REPO_DIR, DATA_SUBDIR)
+    os.makedirs(repo_out, exist_ok=True)
+    for fname in os.listdir(out_dir):
+        if fname.endswith(".json"):
+            with open(os.path.join(out_dir, fname), "rb") as src,                  open(os.path.join(repo_out, fname), "wb") as dst:
+                dst.write(src.read())
     git("add", "-A", DATA_SUBDIR)
     if git("diff", "--cached", "--quiet") == 0:
         return  # nothing changed
@@ -400,7 +420,7 @@ def publish(db: sqlite3.Connection) -> None:
     if git("push", "-q", "origin", f"HEAD:{GIT_BRANCH}") != 0:
         log("  ! push failed; will retry next publish")
     else:
-        log(f"published {len(index)} parks")
+        log(f"published {len(index)} parks (git mirror)")
 
 
 # ---------------------------------------------------------------------------
