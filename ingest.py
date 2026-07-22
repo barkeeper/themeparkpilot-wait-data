@@ -45,6 +45,30 @@ A cold park that reopens is picked up within `cold-every` runs (one hour
 at the shipped 15-minute cadence), which is finer than opening times are
 announced anyway. That saving is what pays for the higher cadence without
 leaning any harder on the upstream than the old hourly run did.
+
+## Why OPEN parks are NOT backed off — don't re-add this
+
+The obvious next optimisation is to skip polling an open park whose
+readings haven't changed, and back off further the longer it stays
+static. It was built, tested, and reverted on 2026-07-22. It is wrong,
+for a reason that isn't obvious until you simulate it:
+
+**backing off skips the START of a change.** The decision to skip is made
+before you know what comes next, so a ride sitting at 20 min all
+afternoon backs off to a 4-run interval, and then the poll that would
+have caught it spiking to 65 never happens. In simulation the recorded
+daily MAX came out at 60 instead of 65 — the archive silently lost the
+peak, which is one of the two things (peaks and breakdown onsets) it
+exists to record. Skipping is safe only for data you already know is
+boring, and that is precisely what you cannot know in advance.
+
+Closed parks are different, and that is why the cold rotation is fine: a
+shut park returns *no data at all*, so a skipped poll loses nothing but
+the discovery latency of it reopening — bounded, and an hour at most.
+
+If the request budget ever needs cutting again, cut it on the axis that
+doesn't lose events: fewer parks (`parks.json` allowlist), a longer cold
+rotation, or a smaller `--window-days`. Not the sampling of live parks.
 """
 from __future__ import annotations
 
