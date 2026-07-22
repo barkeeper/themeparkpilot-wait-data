@@ -48,6 +48,7 @@ peaks are never missed. See docs/wait-history-archive.md for why skipping
 """
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import signal
@@ -89,6 +90,22 @@ CLOSED_INTERVAL_S = int(os.environ.get("CLOSED_INTERVAL_S", "1800"))
 
 # Hard ceiling on outbound requests per second, whatever the schedule says.
 RATE_LIMIT_RPS = float(os.environ.get("RATE_LIMIT_RPS", "2.0"))
+
+# Keep the FULL response, gzipped, every time it changes.
+#
+# The request is the scarce resource, not the disk. Each live payload also
+# carries SINGLE_RIDER / RETURN_TIME / PAID_RETURN_TIME queues, showtimes,
+# operatingHours, diningAvailability and (some parks) an official wait
+# forecast -- all of which the structured tables below throw away. Storing
+# the raw body costs no extra requests and makes any future question
+# answerable from history instead of only from the day you thought to ask.
+# ~2 KB gzipped per change; budget ~35-40 GB/year at 60 s polling.
+STORE_RAW = os.environ.get("STORE_RAW", "1") not in ("0", "false", "no")
+
+# Park opening hours. Changes daily at most, so once a day per park is
+# plenty -- and it is what tells you whether a ride being CLOSED means
+# "broken" or "the park is shut".
+SCHEDULE_INTERVAL_S = int(os.environ.get("SCHEDULE_INTERVAL_S", "86400"))
 
 # How often to regenerate + push the app-facing JSON.
 PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "900"))
@@ -185,7 +202,8 @@ def fetch(url: str, etag: str | None) -> tuple[int, dict | None, str | None]:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS parks (
   id TEXT PRIMARY KEY, name TEXT, etag TEXT,
-  next_at INTEGER DEFAULT 0, last_open INTEGER
+  next_at INTEGER DEFAULT 0, last_open INTEGER,
+  sched_at INTEGER DEFAULT 0, sched_etag TEXT
 );
 -- Every poll, whether or not anything changed. This is what makes a
 -- reading's DURATION reconstructable: a value holds from its row until the
@@ -202,6 +220,18 @@ CREATE TABLE IF NOT EXISTS samples (
 );
 CREATE INDEX IF NOT EXISTS samples_ride_ts ON samples(ride_id, ts);
 CREATE INDEX IF NOT EXISTS samples_park_ts ON samples(park_id, ts);
+-- The whole response, gzipped, whenever it changed. Everything the
+-- structured tables drop is still in here.
+CREATE TABLE IF NOT EXISTS raw (
+  park_id TEXT, ts INTEGER, gz BLOB
+);
+CREATE INDEX IF NOT EXISTS raw_park_ts ON raw(park_id, ts);
+-- Park operating hours, one row per park per date per entry type.
+CREATE TABLE IF NOT EXISTS schedules (
+  park_id TEXT, date TEXT, type TEXT, opening TEXT, closing TEXT,
+  fetched_at INTEGER,
+  PRIMARY KEY (park_id, date, type)
+);
 """
 
 
@@ -230,6 +260,12 @@ def classify(live: dict) -> dict[str, tuple[int | None, str]]:
             w = ((item.get("queue") or {}).get("STANDBY") or {}).get("waitTime")
             if isinstance(w, int) and 0 <= w <= MAX_WAIT:
                 out[rid] = (w, "OPERATING")
+            else:
+                # Operating with no standby queue (a show, or a
+                # virtual-queue-only ride). Still worth a row: "open, no
+                # posted wait" is different from "closed", and the raw
+                # payload holds the RETURN_TIME / BOARDING_GROUP detail.
+                out[rid] = (None, "OPERATING")
         elif status == "DOWN":
             out[rid] = (None, "DOWN")
         elif status in ("CLOSED", "REFURBISHMENT"):
@@ -273,6 +309,12 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
                    (new_etag, now + CLOSED_INTERVAL_S, pid))
         return
 
+    if STORE_RAW:
+        db.execute(
+            "INSERT INTO raw VALUES (?,?,?)",
+            (pid, now, gzip.compress(
+                json.dumps(body, separators=(",", ":")).encode(), 6)))
+
     previous = last_known(db, pid)
     changes = [
         (pid, rid, now, w, s)
@@ -287,6 +329,33 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
         "UPDATE parks SET etag=?, next_at=?, last_open=? WHERE id=?",
         (new_etag, now + POLL_INTERVAL_S + int(throttle.penalty_s), now, pid),
     )
+
+
+def poll_schedule(db: sqlite3.Connection, pid: str, etag: str | None) -> None:
+    """Park opening hours. One request per park per day.
+
+    Worth having for its own sake, and it is also the context that makes
+    the live feed interpretable: a ride reading CLOSED at 03:00 is not a
+    breakdown, it is a shut park. Without hours you cannot tell those
+    apart after the fact.
+    """
+    now = int(time.time())
+    status, body, new_etag = fetch(f"{BASE}/entity/{pid}/schedule", etag)
+    if status == 200 and body:
+        rows = []
+        for e in body.get("schedule", []) or []:
+            d, t = e.get("date"), e.get("type")
+            if d and t:
+                rows.append((pid, d, t, e.get("openingTime"),
+                             e.get("closingTime"), now))
+        if rows:
+            db.executemany(
+                "INSERT INTO schedules VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(park_id,date,type) DO UPDATE SET "
+                "opening=excluded.opening, closing=excluded.closing, "
+                "fetched_at=excluded.fetched_at", rows)
+    db.execute("UPDATE parks SET sched_at=?, sched_etag=? WHERE id=?",
+               (now + SCHEDULE_INTERVAL_S, new_etag, pid))
 
 
 def refresh_park_list(db: sqlite3.Connection) -> None:
@@ -359,6 +428,23 @@ def publish(db: sqlite3.Connection) -> None:
             if closed:
                 entry["c"] = closed
             samples[-1] = entry
+
+        # Extend the series to NOW.
+        #
+        # Rows are only written on change, so without this a ride whose
+        # wait last moved four hours ago produces a chart that simply stops
+        # four hours ago — indistinguishable from "the collector died".
+        # We genuinely know the value held until the most recent poll (the
+        # `polls` table is the evidence), so carry the final state forward
+        # to that timestamp. Not a fabricated reading: it is the last time
+        # we looked and saw exactly this.
+        last_poll = db.execute(
+            "SELECT MAX(ts) FROM polls WHERE park_id=? AND status IN (200,304)",
+            (pid,)).fetchone()[0]
+        if last_poll and samples and last_poll > samples[-1]["t"]:
+            tail = dict(samples[-1])
+            tail["t"] = last_poll
+            samples.append(tail)
         with open(os.path.join(out_dir, f"{pid}.json"), "w",
                   encoding="utf-8") as fh:
             json.dump({"p": pid, "name": name, "generatedAt": now_iso,
@@ -450,6 +536,16 @@ def main() -> int:
             if _stop.is_set():
                 break
             poll_park(db, park)
+        db.commit()
+
+        # Schedules ride the same throttle, so they can never crowd out
+        # live polling — they just fill idle capacity.
+        for pid, sched_etag in db.execute(
+                "SELECT id, sched_etag FROM parks WHERE sched_at<=? "
+                "AND last_open IS NOT NULL LIMIT 5", (now,)).fetchall():
+            if _stop.is_set():
+                break
+            poll_schedule(db, pid, sched_etag)
         db.commit()
 
         if time.monotonic() - last_publish > PUBLISH_INTERVAL_S:
