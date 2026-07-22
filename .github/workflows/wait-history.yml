@@ -10,70 +10,134 @@ name: wait-history
 #   data/wait-history/<parkId>.json          — 7-day rolling raw window
 #   data/wait-history/<parkId>.summary.json  — forever daily min/max/avg
 # Incremental commits (Git delta-compresses the ~99%-unchanged files).
-# GitHub disables cron after 60 days of no commits — the runs keep it
-# alive on their own.
 #
-# ── Cadence: 4×/hour, deliberately NOT on the hour ────────────────────
+# ── Why this run SAMPLES IN A LOOP instead of just relying on cron ────
 #
-# This used to be `cron: "0 * * * *"`. Measured over 2026-07-21/22 that
-# delivered 6 of 16 scheduled runs — a mean gap of 2.6 h, i.e. ~9 samples
-# a day rather than 24. GitHub's shared scheduler drops scheduled jobs
-# under load, and :00 is by far the most contended minute on the whole
-# platform because it is everyone's default.
+# Because on this account, cron does not do what it says. Measured
+# 2026-07-22:
 #
-# So: four staggered minutes, none of them :00 or :30. Even at the same
-# drop rate this is ~4× the samples; in practice the off-peak minutes are
-# dropped far less often, so the real gain is larger.
+#   * this repo's hourly cron delivered 6 runs in 15.6 h — a mean gap of
+#     2.61 h, not 1 h;
+#   * the private repo's `thrill-data` cron is set to 03:00 UTC and fired
+#     at 05:22–06:15 every day for a week — mean lag 2.79 h (min 2.38,
+#     max 3.26);
+#   * after switching this workflow to a 4×/hour cron, four consecutive
+#     slots passed with no run at all.
 #
-# What pays for it (all three matter, see ingest.py):
-#   * window 30 d → 7 d. The app's chart is a trailing-7-day line and the
-#     crowd forecast looks back 7 days, so days 8–30 were downloaded by
-#     every user on every park open and never drawn. Cutting it makes the
-#     per-park download SMALLER than it was at hourly/30 d, even at 4× the
-#     resolution. The forever summary is untouched.
-#   * adaptive polling. ~75 of ~132 parks are shut at any moment; those
-#     are re-probed every 4th run instead of every run, so upstream
-#     request volume lands near the old hourly figure rather than 4× it.
-#   * runner minutes are free — this repo is public, and a run takes ~20 s.
+# Two different repos, same account, same ~2.8 h. That is an account-level
+# queue delay on free-tier scheduled workflows, not random dropping — so
+# no cron expression can fix it. Asking for a run every 15 minutes gets a
+# run every ~2.8 h, exactly as asking for one every hour did.
 #
-# The binding constraint is politeness to themeparks.wiki (a free
-# community API), NOT cost. Don't raise this further without cutting the
-# per-request waste again.
+# The only lever left is to get more out of each trigger that DOES arrive:
+# take several samples per job, spaced by SAMPLE_GAP_SEC, committing after
+# each. One trigger every ~2.8 h × 4 samples ≈ a sample every 40 min,
+# against the ~2.6 h we were actually getting.
+#
+# Sizing is deliberately conservative. A job that sleeps for hours to
+# emulate a persistent service is exactly the pattern GitHub's fair-use
+# policy exists to discourage; 4 samples over 45 minutes is a bounded job
+# doing real work (a poll + a commit) at every step. If it ever needs to
+# come down, set SAMPLES to 1 — that restores the old behaviour exactly.
+#
+# Don't raise the cadence past this without first cutting per-request
+# waste: the binding constraint is politeness to themeparks.wiki, whose
+# own data (measured) only moves every ~26 min for the median ride.
 
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"
-  workflow_dispatch: {}
+    # Kept frequent in case the account's scheduling ever recovers — if
+    # triggers did start arriving every 15 min, the concurrency rule below
+    # cancels the running sampler so each run takes a single sample,
+    # degrading gracefully to the old behaviour.
+    # Listed one per line rather than "7,22,37,52": identical meaning, but
+    # it removes any doubt about list parsing.
+    - cron: "7 * * * *"
+    - cron: "22 * * * *"
+    - cron: "37 * * * *"
+    - cron: "52 * * * *"
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: "Samples to take in this run (blank = default)"
+        required: false
+        default: ""
+      gap:
+        description: "Seconds between samples (blank = default)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
 
 concurrency:
   group: wait-history
-  cancel-in-progress: false
+  # A newer trigger replaces the running sampler rather than queueing
+  # behind it — two loops pushing the same branch would race.
+  cancel-in-progress: true
+
+env:
+  SAMPLES: "4"
+  SAMPLE_GAP_SEC: "900" # 15 min
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
+    # 4 × 15 min = 45 min of sampling; the ceiling is headroom for a slow
+    # poll, not a target.
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Record samples for every park
+      - name: Sample repeatedly, committing after each
+        env:
+          IN_SAMPLES: ${{ inputs.samples }}
+          IN_GAP: ${{ inputs.gap }}
+          RUN_NO: ${{ github.run_number }}
         run: |
-          mkdir -p data/wait-history
-          python ingest.py --data-dir data/wait-history --window-days 7 --workers 6 --cold-every 4
+          set -uo pipefail
+          n="${IN_SAMPLES:-$SAMPLES}"
+          gap="${IN_GAP:-$SAMPLE_GAP_SEC}"
+          n="${n:-$SAMPLES}"
+          gap="${gap:-$SAMPLE_GAP_SEC}"
+          echo "Taking $n sample(s), ${gap}s apart."
 
-      - name: Commit + push
-        run: |
+          mkdir -p data/wait-history
           git config user.name "wait-history-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A data
-          if git diff --cached --quiet; then
-            echo "No data changes to publish."
-            exit 0
-          fi
-          git commit -q -m "wait history $(date -u +%FT%TZ) [run ${{ github.run_number }}]"
-          git push
+
+          ok=0
+          for i in $(seq 1 "$n"); do
+            echo "::group::sample $i/$n"
+            # One bad poll must not abandon the remaining samples — the
+            # upstream having a bad minute is what a retry loop is for.
+            if python ingest.py --data-dir data/wait-history \
+                 --window-days 7 --workers 6 --cold-every 4; then
+              ok=$((ok + 1))
+            else
+              echo "ingest failed on sample $i — continuing"
+            fi
+
+            git add -A data
+            if git diff --cached --quiet; then
+              echo "No data changes to publish."
+            else
+              git commit -q -m "wait history $(date -u +%FT%TZ) [run $RUN_NO.$i]"
+              # Rebase before pushing: a manual commit, or a sampler
+              # cancelled mid-push, can leave the remote ahead and a bare
+              # push would simply fail.
+              git pull --rebase --autostash -q origin main || true
+              git push -q origin HEAD:main || echo "push failed — retrying next sample"
+            fi
+            echo "::endgroup::"
+
+            if [ "$i" -lt "$n" ]; then sleep "$gap"; fi
+          done
+
+          echo "Completed $ok/$n samples."
+          # Only a total wipeout is a failure; a partial is normal when a
+          # park feed flakes.
+          if [ "$ok" -eq 0 ]; then exit 1; fi
