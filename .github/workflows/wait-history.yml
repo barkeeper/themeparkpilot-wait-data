@@ -6,16 +6,43 @@ name: wait-history
 # admin read it over raw.githubusercontent. GitHub Actions + this repo is
 # the whole "server": no backend, no database.
 #
-# Hourly. Two tiers per park (see ingest.py):
-#   data/wait-history/<parkId>.json          — 30-day rolling raw window
+# Two tiers per park (see ingest.py):
+#   data/wait-history/<parkId>.json          — 7-day rolling raw window
 #   data/wait-history/<parkId>.summary.json  — forever daily min/max/avg
 # Incremental commits (Git delta-compresses the ~99%-unchanged files).
-# GitHub disables cron after 60 days of no commits — hourly runs keep it
+# GitHub disables cron after 60 days of no commits — the runs keep it
 # alive on their own.
+#
+# ── Cadence: 4×/hour, deliberately NOT on the hour ────────────────────
+#
+# This used to be `cron: "0 * * * *"`. Measured over 2026-07-21/22 that
+# delivered 6 of 16 scheduled runs — a mean gap of 2.6 h, i.e. ~9 samples
+# a day rather than 24. GitHub's shared scheduler drops scheduled jobs
+# under load, and :00 is by far the most contended minute on the whole
+# platform because it is everyone's default.
+#
+# So: four staggered minutes, none of them :00 or :30. Even at the same
+# drop rate this is ~4× the samples; in practice the off-peak minutes are
+# dropped far less often, so the real gain is larger.
+#
+# What pays for it (all three matter, see ingest.py):
+#   * window 30 d → 7 d. The app's chart is a trailing-7-day line and the
+#     crowd forecast looks back 7 days, so days 8–30 were downloaded by
+#     every user on every park open and never drawn. Cutting it makes the
+#     per-park download SMALLER than it was at hourly/30 d, even at 4× the
+#     resolution. The forever summary is untouched.
+#   * adaptive polling. ~75 of ~132 parks are shut at any moment; those
+#     are re-probed every 4th run instead of every run, so upstream
+#     request volume lands near the old hourly figure rather than 4× it.
+#   * runner minutes are free — this repo is public, and a run takes ~20 s.
+#
+# The binding constraint is politeness to themeparks.wiki (a free
+# community API), NOT cost. Don't raise this further without cutting the
+# per-request waste again.
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -37,7 +64,7 @@ jobs:
       - name: Record samples for every park
         run: |
           mkdir -p data/wait-history
-          python ingest.py --data-dir data/wait-history --window-days 30 --workers 8
+          python ingest.py --data-dir data/wait-history --window-days 7 --workers 6 --cold-every 4
 
       - name: Commit + push
         run: |
