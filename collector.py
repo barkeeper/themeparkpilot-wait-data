@@ -240,6 +240,35 @@ CREATE TABLE IF NOT EXISTS schedules (
   fetched_at INTEGER,
   PRIMARY KEY (park_id, date, type)
 );
+-- EVERY queue type, one row per ride per queue per CHANGE.
+--
+-- `samples` only ever kept the STANDBY wait, so single-rider lines,
+-- virtual-queue return windows, boarding groups and paid Lightning-Lane
+-- PRICES were fetched on every poll and then thrown away -- recoverable
+-- only by decompressing and re-parsing `raw`, which no chart can do.
+-- The feed already contains them; not storing them was pure loss.
+--
+-- `value` is the comparable number for the kind (minutes for STANDBY /
+-- SINGLE_RIDER, minutes-until-return for RETURN_TIME, the group number
+-- for BOARDING_GROUP, price in minor units for PAID_RETURN_TIME) and
+-- `extra` keeps the full sub-object so nothing is lost to a schema
+-- guess made today.
+CREATE TABLE IF NOT EXISTS queues (
+  park_id TEXT, ride_id TEXT, ts INTEGER, kind TEXT,
+  value INTEGER, extra TEXT
+);
+CREATE INDEX IF NOT EXISTS queues_ride_ts ON queues(ride_id, kind, ts);
+CREATE INDEX IF NOT EXISTS queues_park_ts ON queues(park_id, ts);
+-- Ride names + types, so a chart can label a series without calling the
+-- upstream API again. Upserted whenever a poll sees a name.
+CREATE TABLE IF NOT EXISTS entities (
+  id TEXT PRIMARY KEY, park_id TEXT, name TEXT, kind TEXT,
+  first_seen INTEGER, last_seen INTEGER
+);
+CREATE INDEX IF NOT EXISTS entities_park ON entities(park_id);
+-- One-shot bookkeeping (e.g. "queues backfilled from raw"), so an
+-- expensive migration runs once rather than on every container start.
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
 
@@ -264,11 +293,79 @@ def migrate(db: sqlite3.Connection) -> None:
     db.commit()
 
 
+BACKFILL_KEY = "queues_backfilled_from_raw_v1"
+
+
+def backfill_queues(db: sqlite3.Connection) -> None:
+    """Replays archived `raw` payloads into `queues` + `entities`, once.
+
+    STORE_RAW has been on since the start, so every queue type the feed
+    ever carried is already on disk -- just compressed and unqueryable.
+    Without this, `queues` would begin at the moment of this deploy and
+    the existing history would stay invisible, which would be a
+    self-inflicted gap in an archive whose whole promise is that nothing
+    is ever deleted.
+
+    Guarded by a `meta` row: decompressing the entire raw table is
+    expensive and must not run on every container start.
+    """
+    done = db.execute(
+        "SELECT v FROM meta WHERE k=?", (BACKFILL_KEY,)).fetchone()
+    if done:
+        return
+    if db.execute("SELECT 1 FROM queues LIMIT 1").fetchone():
+        db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                   (BACKFILL_KEY, "skipped-nonempty"))
+        db.commit()
+        return
+
+    total = db.execute("SELECT COUNT(*) FROM raw").fetchone()[0]
+    if not total:
+        db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                   (BACKFILL_KEY, "skipped-empty"))
+        db.commit()
+        return
+
+    log(f"backfill: replaying {total} raw payloads into queues/entities…")
+    seen: dict[str, dict[tuple[str, str], tuple]] = {}
+    written = 0
+    # Streamed in timestamp order so the change-only rule produces exactly
+    # what live polling would have produced.
+    for pid, ts, gz in db.execute(
+            "SELECT park_id, ts, gz FROM raw ORDER BY ts"):
+        try:
+            body = json.loads(gzip.decompress(gz).decode())
+        except Exception:
+            continue  # a corrupt blob must not abort the whole backfill
+        prev = seen.setdefault(pid, {})
+        rows = []
+        for (rid, kind), (value, extra) in queue_rows(body, ts).items():
+            if prev.get((rid, kind)) == (value, extra):
+                continue
+            prev[(rid, kind)] = (value, extra)
+            rows.append((pid, rid, ts, kind, value, extra))
+        if rows:
+            db.executemany("INSERT INTO queues VALUES (?,?,?,?,?,?)", rows)
+            written += len(rows)
+        ents = entity_rows(body)
+        if ents:
+            db.executemany(
+                "INSERT INTO entities (id, park_id, name, kind, first_seen, "
+                "last_seen) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                "name=excluded.name, last_seen=excluded.last_seen",
+                [(rid, pid, nm, kd, ts, ts) for rid, nm, kd in ents])
+    db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+               (BACKFILL_KEY, f"rows={written}"))
+    db.commit()
+    log(f"backfill: {written} queue rows recovered from raw")
+
+
 def connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=30)
     db.executescript(SCHEMA)
     migrate(db)
+    backfill_queues(db)
     # WAL: the publisher reads while the poller writes.
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
@@ -301,6 +398,99 @@ def classify(live: dict) -> dict[str, tuple[int | None, str]]:
         elif status in ("CLOSED", "REFURBISHMENT"):
             out[rid] = (None, "CLOSED")
     return out
+
+
+def _return_minutes(sub: dict, now: int) -> int | None:
+    """Minutes from now until a virtual queue's return window opens.
+
+    Stored as a duration rather than the raw timestamp so it is directly
+    comparable with a standby wait -- "come back in 90 minutes" and "queue
+    for 90 minutes" are the same axis, which is the whole point of
+    plotting them together.
+    """
+    raw = sub.get("returnStart") or sub.get("returnTime")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        when = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    mins = int((when.timestamp() - now) / 60)
+    # Past windows and absurd futures are noise, not data.
+    return mins if -60 <= mins <= 1440 else None
+
+
+def queue_rows(live: dict, now: int) -> dict[tuple[str, str], tuple]:
+    """(ride_id, kind) -> (value, extra_json) for every queue in the feed.
+
+    Everything `classify` throws away. Kept deliberately permissive: an
+    unrecognised queue kind still gets a row with a null value and its
+    full sub-object in `extra`, so a new upstream field starts being
+    archived the day it appears rather than the day I notice it.
+    """
+    out: dict[tuple[str, str], tuple] = {}
+    for item in live.get("liveData", []) or []:
+        if (item.get("entityType") or "").upper() not in KINDS:
+            continue
+        rid = item.get("id")
+        if not rid:
+            continue
+        queue = item.get("queue") or {}
+        if not isinstance(queue, dict):
+            continue
+        for kind, sub in queue.items():
+            if not isinstance(sub, dict):
+                continue
+            k = (kind or "").upper()
+            value: int | None = None
+            if k in ("STANDBY", "SINGLE_RIDER"):
+                w = sub.get("waitTime")
+                if isinstance(w, int) and 0 <= w <= MAX_WAIT:
+                    value = w
+            elif k in ("RETURN_TIME", "PAID_RETURN_TIME"):
+                value = _return_minutes(sub, now)
+                price = sub.get("price")
+                if value is None and isinstance(price, dict):
+                    amount = price.get("amount")
+                    if isinstance(amount, int):
+                        value = amount
+            elif k == "BOARDING_GROUP":
+                for key in ("currentGroupStart", "allocationStatus"):
+                    v = sub.get(key)
+                    if isinstance(v, int):
+                        value = v
+                        break
+            out[(rid, k)] = (
+                value,
+                json.dumps(sub, separators=(",", ":"), sort_keys=True),
+            )
+    return out
+
+
+def entity_rows(live: dict) -> list[tuple[str, str, str]]:
+    """(ride_id, name, entityType) for everything named in the feed."""
+    out = []
+    for item in live.get("liveData", []) or []:
+        kind = (item.get("entityType") or "").upper()
+        if kind not in KINDS:
+            continue
+        rid, name = item.get("id"), item.get("name")
+        if rid and isinstance(name, str) and name:
+            out.append((rid, name, kind))
+    return out
+
+
+def last_known_queues(
+    db: sqlite3.Connection, park_id: str
+) -> dict[tuple[str, str], tuple]:
+    rows = db.execute(
+        "SELECT ride_id, kind, value, extra FROM queues WHERE rowid IN "
+        "(SELECT MAX(rowid) FROM queues WHERE park_id=? GROUP BY ride_id, kind)",
+        (park_id,),
+    ).fetchall()
+    return {(r[0], r[1]): (r[2], r[3]) for r in rows}
 
 
 def last_known(db: sqlite3.Connection, park_id: str) -> dict[str, tuple]:
@@ -353,6 +543,26 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
     ]
     if changes:
         db.executemany("INSERT INTO samples VALUES (?,?,?,?,?)", changes)
+
+    # Same change-only discipline as `samples`: a single-rider line that
+    # has not moved costs nothing to keep.
+    prev_q = last_known_queues(db, pid)
+    q_changes = [
+        (pid, rid, now, kind, value, extra)
+        for (rid, kind), (value, extra) in queue_rows(body, now).items()
+        if prev_q.get((rid, kind)) != (value, extra)
+    ]
+    if q_changes:
+        db.executemany("INSERT INTO queues VALUES (?,?,?,?,?,?)", q_changes)
+
+    ents = entity_rows(body)
+    if ents:
+        db.executemany(
+            "INSERT INTO entities (id, park_id, name, kind, first_seen, "
+            "last_seen) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "name=excluded.name, kind=excluded.kind, last_seen=excluded.last_seen",
+            [(rid, pid, nm, kd, now, now) for rid, nm, kd in ents],
+        )
     db.execute("INSERT INTO polls VALUES (?,?,200,?)",
                (pid, now, 1 if changes else 0))
     db.execute(
@@ -532,10 +742,77 @@ def publish(db: sqlite3.Connection) -> None:
                 if d["down"] or d["closed"]:
                     agg += [d["down"], d["closed"]]
                 summary["days"][day][rid] = agg
+        # Ride names, so a chart can label a series without the client
+        # calling the upstream API again just to turn ids into words.
+        summary["rides"] = {
+            r[0]: r[1] for r in db.execute(
+                "SELECT id, name FROM entities WHERE park_id=?", (pid,))
+        }
+        # Hour-of-day profile: 24 buckets of [avg, count] per ride, over
+        # the whole archive. This is the shape a park day actually has --
+        # a daily min/max/avg cannot show that a ride peaks at 14:00 --
+        # and it is cheap because it is derived, not stored.
+        hourly: dict[str, list[list[int]]] = {}
+        for rid, hour, avg, cnt in db.execute(
+                "SELECT ride_id, CAST(strftime('%H', ts, 'unixepoch') AS "
+                "INTEGER), AVG(wait), COUNT(*) FROM samples WHERE park_id=? "
+                "AND state='OPERATING' AND wait IS NOT NULL "
+                "GROUP BY ride_id, 2", (pid,)):
+            slot = hourly.setdefault(rid, [[0, 0] for _ in range(24)])
+            slot[int(hour)] = [round(avg), cnt]
+        summary["hourly"] = hourly
         with open(os.path.join(out_dir, f"{pid}.summary.json"), "w",
                   encoding="utf-8") as fh:
             json.dump(summary, fh, separators=(",", ":"))
-        index.append({"id": pid, "name": name, "samples": len(samples)})
+
+        # Non-standby queues get their own file: most parks have none, so
+        # folding them into the summary would tax every reader for data
+        # only a handful of rides carry.
+        qdays: dict[str, dict[str, dict[str, list]]] = {}
+        for ts, rid, kind, value in db.execute(
+                "SELECT ts, ride_id, kind, value FROM queues WHERE park_id=? "
+                "AND kind<>'STANDBY' AND value IS NOT NULL ORDER BY ts",
+                (pid,)):
+            day = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
+            qdays.setdefault(day, {}).setdefault(rid, {}).setdefault(
+                kind, []).append(value)
+        qout: dict[str, dict] = {}
+        for day, rides in qdays.items():
+            qout[day] = {}
+            for rid, kinds in rides.items():
+                qout[day][rid] = {
+                    k: [min(v), max(v), round(sum(v) / len(v)), len(v)]
+                    for k, v in kinds.items()
+                }
+        if qout:
+            with open(os.path.join(out_dir, f"{pid}.queues.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"p": pid, "name": name, "days": qout}, fh,
+                          separators=(",", ":"))
+
+        # Operating hours. Without them a CLOSED reading is ambiguous --
+        # "broken" and "the park is shut" look identical on a chart.
+        sched = {
+            r[0]: [r[1], r[2]] for r in db.execute(
+                "SELECT date, opening, closing FROM schedules WHERE park_id=? "
+                "AND type='OPERATING'", (pid,))
+        }
+        if sched:
+            with open(os.path.join(out_dir, f"{pid}.schedule.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"p": pid, "days": sched}, fh,
+                          separators=(",", ":"))
+
+        index.append({
+            "id": pid,
+            "name": name,
+            "samples": len(samples),
+            "rides": len(summary["rides"]),
+            "queueKinds": sorted({
+                r[0] for r in db.execute(
+                    "SELECT DISTINCT kind FROM queues WHERE park_id=?", (pid,))
+            }),
+        })
 
     with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as fh:
         json.dump({"generatedAt": now_iso,
