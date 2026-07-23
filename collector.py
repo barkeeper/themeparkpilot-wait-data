@@ -293,7 +293,12 @@ def migrate(db: sqlite3.Connection) -> None:
     db.commit()
 
 
-BACKFILL_KEY = "queues_backfilled_from_raw_v1"
+# Bumped to v2 when PAID_RETURN_TIME's unit bug was fixed. `queues` is
+# 100% derived from `raw`, so the honest repair is to throw the derived
+# table away and rebuild it under the corrected rule rather than leave
+# mixed units in the archive. Nothing is lost: `raw` is the source.
+BACKFILL_KEY = "queues_backfilled_from_raw_v2"
+_STALE_BACKFILL_KEYS = ("queues_backfilled_from_raw_v1",)
 
 
 def backfill_queues(db: sqlite3.Connection) -> None:
@@ -313,6 +318,22 @@ def backfill_queues(db: sqlite3.Connection) -> None:
         "SELECT v FROM meta WHERE k=?", (BACKFILL_KEY,)).fetchone()
     if done:
         return
+
+    # A previous backfill version wrote rows under a rule since found to
+    # be wrong. Drop them and rebuild from `raw`, which is untouched.
+    stale = db.execute(
+        "SELECT 1 FROM meta WHERE k IN (%s)"
+        % ",".join("?" * len(_STALE_BACKFILL_KEYS)), _STALE_BACKFILL_KEYS,
+    ).fetchone()
+    if stale:
+        n = db.execute("SELECT COUNT(*) FROM queues").fetchone()[0]
+        db.execute("DELETE FROM queues")
+        db.execute("DELETE FROM meta WHERE k IN (%s)"
+                   % ",".join("?" * len(_STALE_BACKFILL_KEYS)),
+                   _STALE_BACKFILL_KEYS)
+        db.commit()
+        log(f"backfill: discarded {n} rows from a superseded rule; rebuilding")
+
     if db.execute("SELECT 1 FROM queues LIMIT 1").fetchone():
         db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
                    (BACKFILL_KEY, "skipped-nonempty"))
@@ -449,13 +470,21 @@ def queue_rows(live: dict, now: int) -> dict[tuple[str, str], tuple]:
                 w = sub.get("waitTime")
                 if isinstance(w, int) and 0 <= w <= MAX_WAIT:
                     value = w
-            elif k in ("RETURN_TIME", "PAID_RETURN_TIME"):
-                value = _return_minutes(sub, now)
+            elif k == "PAID_RETURN_TIME":
+                # ALWAYS the price, in minor units (2900 == $29.00).
+                #
+                # This sub-object carries a return window AND a price. An
+                # earlier version stored whichever was present -- minutes
+                # during park hours, price once the window emptied -- so a
+                # single series silently switched units halfway through the
+                # day. Two numbers that mean different things must never
+                # share a series; the window is still in `extra`.
                 price = sub.get("price")
-                if value is None and isinstance(price, dict):
-                    amount = price.get("amount")
-                    if isinstance(amount, int):
-                        value = amount
+                if isinstance(price, dict) and isinstance(
+                        price.get("amount"), int):
+                    value = price["amount"]
+            elif k == "RETURN_TIME":
+                value = _return_minutes(sub, now)
             elif k == "BOARDING_GROUP":
                 for key in ("currentGroupStart", "allocationStatus"):
                     v = sub.get(key)
