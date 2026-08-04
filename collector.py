@@ -389,7 +389,21 @@ def connect() -> sqlite3.Connection:
     backfill_queues(db)
     # WAL: the publisher reads while the poller writes.
     db.execute("PRAGMA journal_mode=WAL")
-    db.execute("PRAGMA synchronous=NORMAL")
+    # FULL, not NORMAL (changed 2026-08-04 after a real corruption).
+    #
+    # In WAL mode NORMAL means SQLite does not fsync on commit -- it syncs
+    # only at checkpoints. That is a fine trade on a filesystem with sane
+    # write ordering. This archive lives on ntfs3, which is not one: when
+    # the volume stopped accepting writes mid-transaction, the WAL was
+    # truncated to zero bytes and the main database was left holding
+    # committed pages the WAL could no longer complete. Result: malformed
+    # B-tree pages, and only the nightly VACUUM INTO backup made it
+    # recoverable.
+    #
+    # FULL costs one fsync per commit. At roughly two writes a second that
+    # is not a measurable cost here, and it is the difference between
+    # "lost the last few samples" and "lost the database".
+    db.execute("PRAGMA synchronous=FULL")
     db.commit()
     return db
 
