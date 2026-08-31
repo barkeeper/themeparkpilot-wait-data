@@ -1,0 +1,382 @@
+{
+  "$schema": "https://themeparkpilot/source-map/v1",
+  "generatedAt": "2026-08-31T13:07:22Z",
+  "count": 75,
+  "mappings": {
+    "000c724a-cd0f-41a1-b355-f764902c2b55": {
+      "id": "69",
+      "score": 0.6,
+      "name": "Six Flags Great Escape"
+    },
+    "043211c0-76f2-4456-89f8-4001be01018d": {
+      "id": "14",
+      "score": 1.0,
+      "name": "Gardaland"
+    },
+    "0c14c187-13f5-41ef-91b1-7ecb504239a7": {
+      "id": "11",
+      "score": 1.0,
+      "name": "LEGOLAND Japan"
+    },
+    "0c7ab128-259a-4390-93b9-d2e0233dfc16": {
+      "id": "67",
+      "score": 1.0,
+      "name": "Six Flags Over Georgia"
+    },
+    "0d8ea921-37b1-4a9a-b8ef-5b45afea847b": {
+      "id": "3",
+      "score": 1.0,
+      "name": "Alton Towers"
+    },
+    "12dbb85b-265f-44e6-bccf-f1faa17211fc": {
+      "id": "56",
+      "score": 1.0,
+      "name": "Universal Epic Universe"
+    },
+    "15805a4d-4023-4702-b9f2-3d3cab2e0c1e": {
+      "id": "71",
+      "score": 1.0,
+      "name": "Six Flags Great America"
+    },
+    "164f3ee7-5fd7-47ac-addc-40b5e3e2b144": {
+      "id": "37",
+      "score": 1.0,
+      "name": "Bellewaerde"
+    },
+    "18635b3e-fa23-4284-89dd-9fcd0aaa9c9c": {
+      "id": "35",
+      "score": 1.0,
+      "name": "Walibi Holland"
+    },
+    "19d7f29b-e2e7-4c95-bd12-2d4e37d14ccf": {
+      "id": "51",
+      "score": 1.0,
+      "name": "Dorney Park"
+    },
+    "1ea86991-e2c2-4771-8a32-c6e14c8298a9": {
+      "id": "23",
+      "score": 1.0,
+      "name": "Parque de Atracciones de Madrid"
+    },
+    "21897ba2-cc63-460e-99b0-fcd4ca7c18ef": {
+      "id": "36",
+      "score": 1.0,
+      "name": "Walibi Belgium"
+    },
+    "24cdcaa8-0500-4340-9725-992865eb18d6": {
+      "id": "43",
+      "score": 1.0,
+      "name": "Carowinds"
+    },
+    "267615cc-8943-4c2a-ae2c-5da728ca591f": {
+      "id": "54",
+      "score": 1.0,
+      "name": "Universal Islands of Adventure"
+    },
+    "27d64dee-d85e-48dc-ad6d-8077445cd946": {
+      "id": "61",
+      "score": 1.0,
+      "name": "SeaWorld Orlando"
+    },
+    "2fa98365-3f69-4741-a1c5-1f7e3a322b23": {
+      "id": "92",
+      "score": 1.0,
+      "name": "Flamingo Land"
+    },
+    "30713cf6-69a9-47c9-a505-52bb965f01be": {
+      "id": "28",
+      "score": 1.0,
+      "name": "Efteling"
+    },
+    "3237a0c2-8e35-4a1c-9356-a319d5988e7c": {
+      "id": "74",
+      "score": 1.0,
+      "name": "Six Flags Discovery Kingdom"
+    },
+    "324a4b89-e6c6-47d8-aeb4-aa8aea1fd578": {
+      "id": "80",
+      "score": 0.6,
+      "name": "Six Flags Qiddiya City"
+    },
+    "3782a489-b9ca-428f-8bb5-4de4fc38d815": {
+      "id": "84",
+      "score": 1.0,
+      "name": "Blackpool Pleasure Beach"
+    },
+    "39c46e22-9031-41ff-84d6-fcd1d0a62867": {
+      "id": "8",
+      "score": 1.0,
+      "name": "LEGOLAND New York"
+    },
+    "3ad67aac-0b97-4961-8aa8-c3b8d2350873": {
+      "id": "82",
+      "score": 1.0,
+      "name": "Plopsaland Deutschland"
+    },
+    "3dada5aa-0feb-4a3a-8c2d-685901f256be": {
+      "id": "19",
+      "score": 1.0,
+      "name": "Kennywood"
+    },
+    "4535960b-45fb-49fb-a38a-59cf602a0a9c": {
+      "id": "66",
+      "score": 1.0,
+      "name": "Six Flags Over Texas"
+    },
+    "47f90d2c-e191-4239-a466-5892ef59a88b": {
+      "id": "58",
+      "score": 1.0,
+      "name": "EPCOT"
+    },
+    "556f0126-8082-4b66-aeee-1e3593fed188": {
+      "id": "69",
+      "score": 1.0,
+      "name": "Six Flags Great Adventure"
+    },
+    "589627eb-fe16-4373-a2db-08d73805fb1f": {
+      "id": "80",
+      "score": 1.0,
+      "name": "Six Flags Frontier City"
+    },
+    "5adbd2f7-3694-4d23-aaec-4037a056573f": {
+      "id": "24",
+      "score": 1.0,
+      "name": "Parque Warner Madrid"
+    },
+    "5d4442cf-0db1-4406-942b-a7052e743e99": {
+      "id": "45",
+      "score": 0.667,
+      "name": "Cedar Point Shores"
+    },
+    "639738d3-9574-4f60-ab5b-4c392901320b": {
+      "id": "31",
+      "score": 1.0,
+      "name": "Europa-Park"
+    },
+    "6535c36f-ea51-4156-824e-f304b27fb1f6": {
+      "id": "1",
+      "score": 1.0,
+      "name": "Paultons Park"
+    },
+    "66e12a41-3a09-40cd-8f55-8d335d9d7d93": {
+      "id": "16",
+      "score": 1.0,
+      "name": "Heide Park"
+    },
+    "722116aa-56be-4466-8c6f-a5acbac05da2": {
+      "id": "7",
+      "score": 1.0,
+      "name": "LEGOLAND California"
+    },
+    "7340550b-c14d-4def-80bb-acdb51d49a66": {
+      "id": "89",
+      "score": 1.0,
+      "name": "Disneyland Park"
+    },
+    "7502308a-de08-41a3-b997-961f8275ab3c": {
+      "id": "39",
+      "score": 1.0,
+      "name": "Dollywood"
+    },
+    "75122979-ddea-414d-b633-6b09042a227c": {
+      "id": "63",
+      "score": 1.0,
+      "name": "SeaWorld San Diego"
+    },
+    "75ea578a-adc8-4116-a54d-dccb60765ef9": {
+      "id": "57",
+      "score": 1.0,
+      "name": "Magic Kingdom Park"
+    },
+    "832fcd51-ea19-4e77-85c7-75d5843b127c": {
+      "id": "90",
+      "score": 1.0,
+      "name": "Disney California Adventure Park"
+    },
+    "8bd6937c-71da-4c56-b780-600de69ba874": {
+      "id": "22",
+      "score": 1.0,
+      "name": "Mirabilandia"
+    },
+    "8be1e984-1e5f-40d0-a750-ce8e4dc2e87c": {
+      "id": "72",
+      "score": 1.0,
+      "name": "Six Flags Fiesta Texas"
+    },
+    "90917f88-4774-46d9-8b5c-23e5b94e8ded": {
+      "id": "15",
+      "score": 1.0,
+      "name": "Djurs Sommerland"
+    },
+    "90d49146-8ae8-4f74-b2e6-2c91f3be6067": {
+      "id": "18",
+      "score": 0.667,
+      "name": "Peppa Pig Theme Park"
+    },
+    "93142d7e-024a-4877-9c72-f8e904a37c0c": {
+      "id": "30",
+      "score": 1.0,
+      "name": "Liseberg"
+    },
+    "95162318-b955-4b7e-b601-a99033aa0279": {
+      "id": "49",
+      "score": 1.0,
+      "name": "Kings Dominion"
+    },
+    "98f634cd-c388-439c-b309-960f9475b84d": {
+      "id": "65",
+      "score": 1.0,
+      "name": "Busch Gardens Williamsburg"
+    },
+    "99e7087b-951a-4322-84a8-572f26bc324d": {
+      "id": "9",
+      "score": 1.0,
+      "name": "LEGOLAND Billund"
+    },
+    "9a35410b-a840-4189-abf3-fccd429f4d78": {
+      "id": "12",
+      "score": 1.0,
+      "name": "LEGOLAND® Korea"
+    },
+    "9e938687-fd99-46f3-986a-1878210378f8": {
+      "id": "32",
+      "score": 1.0,
+      "name": "Parc Asterix"
+    },
+    "a0df8d87-7f72-4545-a58d-eb8aa76f914b": {
+      "id": "42",
+      "score": 1.0,
+      "name": "Kings Island"
+    },
+    "a4f71074-e616-4de4-9278-72fdecbdc995": {
+      "id": "5",
+      "score": 1.0,
+      "name": "LEGOLAND Windsor"
+    },
+    "ab49b801-9b07-4cbc-9b3e-9896e538872e": {
+      "id": "79",
+      "score": 1.0,
+      "name": "Six Flags Darien Lake"
+    },
+    "abb67808-61e3-49ef-996c-1b97ed64fac6": {
+      "id": "29",
+      "score": 1.0,
+      "name": "Phantasialand"
+    },
+    "ae959d1f-9fcc-4aab-8063-71e641fa57f4": {
+      "id": "4",
+      "score": 1.0,
+      "name": "Chessington World of Adventures"
+    },
+    "b08d9272-d070-4580-9fcd-375270b191a7": {
+      "id": "2",
+      "score": 1.0,
+      "name": "Thorpe Park"
+    },
+    "b4c6ca41-1cf6-465b-9f65-aea736a308cb": {
+      "id": "21",
+      "score": 1.0,
+      "name": "Bobbejaanland"
+    },
+    "bb26f3ad-3cad-4565-81b1-1ced1ed802c4": {
+      "id": "20",
+      "score": 1.0,
+      "name": "Movie Park Germany"
+    },
+    "bb731eae-7bd3-4713-bd7b-89d79b031743": {
+      "id": "47",
+      "score": 1.0,
+      "name": "Worlds of Fun"
+    },
+    "bc4005c5-8c7e-41d7-b349-cdddf1796427": {
+      "id": "52",
+      "score": 1.0,
+      "name": "Universal Studios Hollywood"
+    },
+    "bdf9b533-144c-4b78-aa2f-5173c5ce5e85": {
+      "id": "46",
+      "score": 0.667,
+      "name": "Great America"
+    },
+    "c6073ab0-83aa-4e25-8d60-12c8f25684bc": {
+      "id": "70",
+      "score": 1.0,
+      "name": "Six Flags Magic Mountain"
+    },
+    "c8299e1a-0098-4677-8ead-dd0da204f8dc": {
+      "id": "45",
+      "score": 1.0,
+      "name": "Cedar Point"
+    },
+    "ca888437-ebb4-4d50-aed2-d227f7096968": {
+      "id": "90",
+      "score": 0.667,
+      "name": "Disney Adventure World"
+    },
+    "d21fac4f-1099-4461-849c-0f8e0d6e85a6": {
+      "id": "40",
+      "score": 1.0,
+      "name": "Silver Dollar City"
+    },
+    "d2bef7bc-f9fc-4272-a6f1-2539d7413911": {
+      "id": "78",
+      "score": 0.667,
+      "name": "La Ronde"
+    },
+    "d4c88416-3361-494d-8905-23a83e9cb091": {
+      "id": "73",
+      "score": 1.0,
+      "name": "Six Flags America"
+    },
+    "d553882d-5316-4fca-9530-cc898258aec0": {
+      "id": "75",
+      "score": 1.0,
+      "name": "Six Flags New England"
+    },
+    "d67e40f9-9c02-4bfe-8ee1-b714deda9906": {
+      "id": "77",
+      "score": 1.0,
+      "name": "Six Flags Mexico"
+    },
+    "dae968d5-630d-4719-8b06-3d107e944401": {
+      "id": "89",
+      "score": 1.0,
+      "name": "Disneyland Park"
+    },
+    "dd0e159a-4e4b-48e5-8949-353794ef2ecb": {
+      "id": "62",
+      "score": 1.0,
+      "name": "SeaWorld San Antonio"
+    },
+    "ddc4357c-c148-4b36-9888-07894fe75e83": {
+      "id": "91",
+      "score": 1.0,
+      "name": "Shanghai Disneyland"
+    },
+    "e35cd439-ca3c-4234-ad92-d699995d0cba": {
+      "id": "10",
+      "score": 1.0,
+      "name": "LEGOLAND Deutschland"
+    },
+    "eb3f4560-2383-4a36-9152-6b3e5ed6bc57": {
+      "id": "53",
+      "score": 1.0,
+      "name": "Universal Studios Florida"
+    },
+    "fc40c99a-be0a-42f4-a483-1e939db275c2": {
+      "id": "64",
+      "score": 1.0,
+      "name": "Busch Gardens Tampa"
+    },
+    "fd747bb4-393f-4dff-afdd-9ee2533a1869": {
+      "id": "17",
+      "score": 1.0,
+      "name": "Knoebels Amusement Park"
+    },
+    "fe78a026-b91b-470c-b906-9d2266b692da": {
+      "id": "55",
+      "score": 1.0,
+      "name": "Universal Volcano Bay"
+    }
+  }
+}

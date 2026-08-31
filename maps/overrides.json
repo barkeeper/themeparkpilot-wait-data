@@ -1,0 +1,11 @@
+{
+  "_comment": "Hand-curated fixes that WIN over the generated maps. Shape: {source: {parkmap: {tp_park_uuid: source_park_id}, ridemap: {source_ride_id: tp_entity_uuid}}}. Survives a regeneration.",
+  "queue_times": {
+    "parkmap": {},
+    "ridemap": {}
+  },
+  "parkqueuetimes": {
+    "parkmap": {},
+    "ridemap": {}
+  }
+}
