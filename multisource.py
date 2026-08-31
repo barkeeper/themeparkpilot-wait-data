@@ -81,7 +81,9 @@ def _pqt_live_url(ext_id: str) -> str:
 
 def _pqt_classify(body: dict) -> dict[str, tuple[int | None, str]]:
     """parkqueuetimes: {data:{rides|lands[].rides}}. Defensive about field
-    names (wait_time/waitTime/wait; is_open/status)."""
+    names (wait_time/waitTime/waitMinutes/wait; is_open/status).
+    The live API returns `waitMinutes`; omitting it silently dropped every
+    wait, degrading the merge to single_source for every ride."""
     data = body.get("data", body) or {}
     rides = []
     for land in data.get("lands", []) or []:
@@ -101,6 +103,8 @@ def _pqt_classify(body: dict) -> dict[str, tuple[int | None, str]]:
             w = r.get("wait_time")
             if w is None:
                 w = r.get("waitTime")
+            if w is None:
+                w = r.get("waitMinutes")
             if w is None:
                 w = r.get("wait")
             w = w if isinstance(w, int) and 0 <= w <= MAX_WAIT else None
