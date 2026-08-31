@@ -48,7 +48,6 @@ peaks are never missed. See docs/wait-history-archive.md for why skipping
 """
 from __future__ import annotations
 
-import bisect
 import gzip
 import json
 import os
@@ -60,9 +59,16 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
+
+import multisource
 
 BASE = "https://api.themeparks.wiki/v1"
+
+# How often to regenerate the small, fresh per-park live file the app reads.
+# Decoupled from the heavy 15-min PUBLISH_INTERVAL_S: live must be fresh
+# (the app treats data >20 min old as stale), the 7-day window need not be.
+LIVE_PUBLISH_INTERVAL_S = int(os.environ.get("LIVE_PUBLISH_INTERVAL_S", "60"))
 CONTACT = os.environ.get("CONTACT_URL", "https://github.com/barkeeper")
 UA = f"themeparkpilot-wait-history/3.0 (+{CONTACT}; self-hosted collector)"
 
@@ -171,14 +177,19 @@ class Throttle:
 throttle = Throttle(RATE_LIMIT_RPS)
 
 
-def fetch(url: str, etag: str | None) -> tuple[int, dict | None, str | None]:
+def fetch(
+    url: str, etag: str | None, headers: dict | None = None
+) -> tuple[int, dict | None, str | None]:
     """Conditional GET. Returns (status, body_or_None, etag).
 
     304 means the payload is byte-identical to what we already hold — the
     cheapest possible answer for the origin, and the common case.
+
+    ``headers`` lets a caller add source-specific headers (e.g. the
+    parkqueuetimes ``x-api-key``) without every source needing its own fetch.
     """
     throttle.wait()
-    headers = {"User-Agent": UA, "Accept": "application/json"}
+    headers = {"User-Agent": UA, "Accept": "application/json", **(headers or {})}
     if etag:
         headers["If-None-Match"] = etag
     req = urllib.request.Request(url, headers=headers)
@@ -281,9 +292,6 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 _PARK_COLUMNS = {
     "sched_at": "INTEGER DEFAULT 0",
     "sched_etag": "TEXT",
-    # IANA zone, straight off the schedule response. Published so a
-    # reader never has to keep its own park -> timezone table.
-    "tz": "TEXT",
 }
 
 
@@ -370,7 +378,9 @@ def backfill_queues(db: sqlite3.Connection) -> None:
             prev[(rid, kind)] = (value, extra)
             rows.append((pid, rid, ts, kind, value, extra))
         if rows:
-            db.executemany("INSERT INTO queues VALUES (?,?,?,?,?,?)", rows)
+            db.executemany(
+                "INSERT INTO queues (park_id, ride_id, ts, kind, value, extra, "
+                "source) VALUES (?,?,?,?,?,?,'themeparks')", rows)
             written += len(rows)
         ents = entity_rows(body)
         if ents:
@@ -391,23 +401,16 @@ def connect() -> sqlite3.Connection:
     db.executescript(SCHEMA)
     migrate(db)
     backfill_queues(db)
+    # Multi-source: add the `source` columns + per-(park,source) scheduling,
+    # then seed scheduling rows for every park each enabled source can map.
+    multisource.ensure_schema(db)
+    for source in multisource.enabled_sources():
+        added = multisource.seed_source_state(db, source)
+        if added:
+            log(f"source '{source}': scheduled {added} new parks")
     # WAL: the publisher reads while the poller writes.
     db.execute("PRAGMA journal_mode=WAL")
-    # FULL, not NORMAL (changed 2026-08-04 after a real corruption).
-    #
-    # In WAL mode NORMAL means SQLite does not fsync on commit -- it syncs
-    # only at checkpoints. That is a fine trade on a filesystem with sane
-    # write ordering. This archive lives on ntfs3, which is not one: when
-    # the volume stopped accepting writes mid-transaction, the WAL was
-    # truncated to zero bytes and the main database was left holding
-    # committed pages the WAL could no longer complete. Result: malformed
-    # B-tree pages, and only the nightly VACUUM INTO backup made it
-    # recoverable.
-    #
-    # FULL costs one fsync per commit. At roughly two writes a second that
-    # is not a measurable cost here, and it is the difference between
-    # "lost the last few samples" and "lost the database".
-    db.execute("PRAGMA synchronous=FULL")
+    db.execute("PRAGMA synchronous=NORMAL")
     db.commit()
     return db
 
@@ -555,14 +558,16 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
     status, body, new_etag = fetch(f"{BASE}/entity/{pid}/live", etag)
 
     if status == 304:
-        db.execute("INSERT INTO polls VALUES (?,?,?,0)", (pid, now, 304))
+        db.execute("INSERT INTO polls (park_id, ts, status, changed, source) "
+                   "VALUES (?,?,?,0,'themeparks')", (pid, now, 304))
         db.execute("UPDATE parks SET next_at=? WHERE id=?",
                    (now + POLL_INTERVAL_S + int(throttle.penalty_s), pid))
         return
     if status != 200 or body is None:
         # Transient: retry on the normal cadence rather than punishing the
         # park for the API having a bad minute.
-        db.execute("INSERT INTO polls VALUES (?,?,?,0)", (pid, now, status))
+        db.execute("INSERT INTO polls (park_id, ts, status, changed, source) "
+                   "VALUES (?,?,?,0,'themeparks')", (pid, now, status))
         db.execute("UPDATE parks SET next_at=? WHERE id=?",
                    (now + POLL_INTERVAL_S + int(throttle.penalty_s), pid))
         return
@@ -571,14 +576,16 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
     operating = {r for r, (w, s) in current.items() if s == "OPERATING"}
     if not operating:
         # Shut, or no live feed. Slow rotation; nothing to record.
-        db.execute("INSERT INTO polls VALUES (?,?,200,0)", (pid, now))
+        db.execute("INSERT INTO polls (park_id, ts, status, changed, source) "
+                   "VALUES (?,?,200,0,'themeparks')", (pid, now))
         db.execute("UPDATE parks SET etag=?, next_at=? WHERE id=?",
                    (new_etag, now + CLOSED_INTERVAL_S, pid))
         return
 
     if STORE_RAW:
         db.execute(
-            "INSERT INTO raw VALUES (?,?,?)",
+            "INSERT INTO raw (park_id, ts, gz, source) "
+            "VALUES (?,?,?,'themeparks')",
             (pid, now, gzip.compress(
                 json.dumps(body, separators=(",", ":")).encode(), 6)))
 
@@ -589,7 +596,9 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
         if previous.get(rid) != (w, s)
     ]
     if changes:
-        db.executemany("INSERT INTO samples VALUES (?,?,?,?,?)", changes)
+        db.executemany(
+            "INSERT INTO samples (park_id, ride_id, ts, wait, state, source) "
+            "VALUES (?,?,?,?,?,'themeparks')", changes)
 
     # Same change-only discipline as `samples`: a single-rider line that
     # has not moved costs nothing to keep.
@@ -600,7 +609,9 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
         if prev_q.get((rid, kind)) != (value, extra)
     ]
     if q_changes:
-        db.executemany("INSERT INTO queues VALUES (?,?,?,?,?,?)", q_changes)
+        db.executemany(
+            "INSERT INTO queues (park_id, ride_id, ts, kind, value, extra, "
+            "source) VALUES (?,?,?,?,?,?,'themeparks')", q_changes)
 
     ents = entity_rows(body)
     if ents:
@@ -610,7 +621,8 @@ def poll_park(db: sqlite3.Connection, park: tuple) -> None:
             "name=excluded.name, kind=excluded.kind, last_seen=excluded.last_seen",
             [(rid, pid, nm, kd, now, now) for rid, nm, kd in ents],
         )
-    db.execute("INSERT INTO polls VALUES (?,?,200,?)",
+    db.execute("INSERT INTO polls (park_id, ts, status, changed, source) "
+               "VALUES (?,?,200,?,'themeparks')",
                (pid, now, 1 if changes else 0))
     db.execute(
         "UPDATE parks SET etag=?, next_at=?, last_open=? WHERE id=?",
@@ -656,13 +668,6 @@ def poll_schedule(db: sqlite3.Connection, pid: str, etag: str | None) -> None:
     now = int(time.time())
     status, body, new_etag = fetch(f"{BASE}/entity/{pid}/schedule", etag)
     if status == 200 and body:
-        # The zone comes free with a request we already make daily. It is
-        # the only place in this feed that names it -- `/live` does not
-        # carry one -- and it is what lets `publish` bucket a day on the
-        # park's own calendar instead of on Greenwich's.
-        tz = body.get("timezone")
-        if isinstance(tz, str) and "/" in tz:
-            db.execute("UPDATE parks SET tz=? WHERE id=?", (tz, pid))
         rows = []
         for e in body.get("schedule", []) or []:
             d, t = e.get("date"), e.get("type")
@@ -697,117 +702,6 @@ def refresh_park_list(db: sqlite3.Connection) -> None:
             )
     db.commit()
     log(f"park list refreshed: {seen} parks known")
-
-
-# ---------------------------------------------------------------------------
-# What day is it, where the queue is
-# ---------------------------------------------------------------------------
-#
-# Every aggregate below used to be bucketed on the UTC calendar, because
-# that is what `datetime.fromtimestamp(ts, timezone.utc)` gives you and
-# because it is right for exactly the parks nobody complains about.
-#
-# It is wrong everywhere else, in two ways that look different and are the
-# same mistake:
-#
-#   * HOURS. The hour-of-day profile put Hong Kong Disneyland's opening
-#     rush at 02:00 and wrapped Universal Hollywood's evening around
-#     midnight. A reader can undo that if it knows the offset, and the
-#     Park en Pret interface now does.
-#   * DAYS. A park west of Greenwich closes after midnight UTC, so part of
-#     its Friday evening -- the busiest hours it has -- is counted into
-#     Saturday. **No reader can undo that one.** By the time the JSON is
-#     written the samples are already summed into the wrong bucket.
-#
-# So the day boundary has to be right here or not at all. Barkeeper asked
-# for it after the client-side hour fix landed.
-#
-# ## Where the offset comes from, and why not `zoneinfo`
-#
-# `ZoneInfo("Asia/Hong_Kong")` needs the IANA database on disk. This image
-# is `python:3.12-slim` with no pip installs on purpose ("no dependency
-# chain to rot"), and Debian slim does not promise tzdata -- so the tidy
-# answer would add either a package install or a pip dependency to a
-# container whose whole design is not having any.
-#
-# It is also unnecessary, because the API hands us the offset already:
-#
-#     "openingTime": "2026-08-10T10:00:00+08:00"
-#
-# One of those per park per DATE, in the `schedules` table we have been
-# filling daily since the beginning. That is better than a zone name and a
-# tz database: it is DST-correct per day by construction, with no rules to
-# keep current, and it is the park's own statement about its own clock.
-#
-# The zone NAME is still captured and published, for readers that want to
-# format a timestamp rather than bucket one.
-
-
-def _iso_offset(stamp: str | None) -> int | None:
-    """Seconds east of UTC from an ISO 8601 tail: `+08:00`, `-07:00`, `Z`."""
-    if not stamp or len(stamp) < 6:
-        return None
-    tail = stamp[-6:]
-    if tail[0] in "+-" and tail[3] == ":":
-        try:
-            hours, minutes = int(tail[1:3]), int(tail[4:6])
-        except ValueError:
-            return None
-        return (1 if tail[0] == "+" else -1) * (hours * 3600 + minutes * 60)
-    if stamp.endswith("Z"):
-        return 0
-    return None
-
-
-class ParkClock:
-    """The park's own calendar, per date, from its published hours.
-
-    Falls back to the nearest date it does know about, which is what keeps
-    the archive's older days -- collected before the schedule table went
-    back that far -- on the same calendar as the recent ones. A park with
-    no usable hours at all stays on UTC and says so, rather than guessing
-    an offset from a longitude nobody checked.
-    """
-
-    def __init__(self, db: sqlite3.Connection, pid: str) -> None:
-        self.offsets: dict[str, int] = {}
-        for date, opening, closing in db.execute(
-                "SELECT date, opening, closing FROM schedules WHERE park_id=?",
-                (pid,)):
-            off = _iso_offset(opening)
-            if off is None:
-                off = _iso_offset(closing)
-            if off is not None and isinstance(date, str):
-                self.offsets[date] = off
-        self.dates = sorted(self.offsets)
-        self.known = bool(self.dates)
-
-    def offset_for(self, utc_date: str) -> int:
-        if not self.known:
-            return 0
-        exact = self.offsets.get(utc_date)
-        if exact is not None:
-            return exact
-        i = bisect.bisect_left(self.dates, utc_date)
-        near = [d for d in (self.dates[i - 1] if i else None,
-                            self.dates[i] if i < len(self.dates) else None)
-                if d]
-        best = min(near, key=lambda d: abs(
-            (date.fromisoformat(d) - date.fromisoformat(utc_date)).days))
-        return self.offsets[best]
-
-    def parts(self, ts: int) -> tuple[str, int]:
-        """(local date, local hour) for an epoch second.
-
-        The offset is looked up by UTC date, which is off by one day only
-        for readings within `offset` of midnight -- and those two dates
-        share an offset except across a DST change, where the error is an
-        hour on one boundary reading.
-        """
-        utc_date = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
-        local = datetime.fromtimestamp(ts + self.offset_for(utc_date),
-                                       timezone.utc)
-        return local.strftime("%Y-%m-%d"), local.hour
 
 
 # ---------------------------------------------------------------------------
@@ -883,38 +777,21 @@ def publish(db: sqlite3.Connection) -> None:
                        "windowDays": PUBLISH_WINDOW_DAYS,
                        "samples": samples}, fh, separators=(",", ":"))
 
-        # Forever daily summary, straight from the full archive, bucketed
-        # on the PARK'S calendar -- see ParkClock above for why that
-        # cannot be left to the reader.
-        clock = ParkClock(db, pid)
+        # Forever daily summary, straight from the full archive.
         days: dict[str, dict[str, dict]] = {}
-        # The hour profile is accumulated in the SAME pass now. It used to
-        # be a second full scan with `strftime('%H', ts, 'unixepoch')`,
-        # which is UTC and has nowhere to put a per-date offset.
-        hours: dict[str, list[list[int]]] = {}
         for ts, rid, wait, st in db.execute(
                 "SELECT ts, ride_id, wait, state FROM samples WHERE park_id=? "
                 "ORDER BY ts", (pid,)):
-            day, hour = clock.parts(ts)
+            day = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
             slot = days.setdefault(day, {}).setdefault(
                 rid, {"w": [], "down": 0, "closed": 0})
             if st == "OPERATING" and wait is not None:
                 slot["w"].append(wait)
-                bucket = hours.setdefault(rid, [[0, 0] for _ in range(24)])
-                bucket[hour][0] += wait
-                bucket[hour][1] += 1
             elif st == "DOWN":
                 slot["down"] += 1
             elif st == "CLOSED":
                 slot["closed"] += 1
-        tz = db.execute("SELECT tz FROM parks WHERE id=?", (pid,)).fetchone()[0]
         summary = {"p": pid, "name": name, "days": {}}
-        # Say which clock these buckets are on, so a reader never has to
-        # guess and never has to shift them a second time. Absent or false
-        # means UTC, which is what every file written before today is.
-        summary["localTime"] = clock.known
-        if tz:
-            summary["tz"] = tz
         for day, rides in days.items():
             summary["days"][day] = {}
             for rid, d in rides.items():
@@ -931,15 +808,18 @@ def publish(db: sqlite3.Connection) -> None:
                 "SELECT id, name FROM entities WHERE park_id=?", (pid,))
         }
         # Hour-of-day profile: 24 buckets of [avg, count] per ride, over
-        # the whole archive, on the park's clock. This is the shape a park
-        # day actually has -- a daily min/max/avg cannot show that a ride
-        # peaks at 14:00 -- and it is cheap because it is derived, not
-        # stored. Accumulated as [sum, count] in the loop above and
-        # averaged here, so it costs no second scan of `samples`.
-        summary["hourly"] = {
-            rid: [[round(total / n) if n else 0, n] for total, n in buckets]
-            for rid, buckets in hours.items()
-        }
+        # the whole archive. This is the shape a park day actually has --
+        # a daily min/max/avg cannot show that a ride peaks at 14:00 --
+        # and it is cheap because it is derived, not stored.
+        hourly: dict[str, list[list[int]]] = {}
+        for rid, hour, avg, cnt in db.execute(
+                "SELECT ride_id, CAST(strftime('%H', ts, 'unixepoch') AS "
+                "INTEGER), AVG(wait), COUNT(*) FROM samples WHERE park_id=? "
+                "AND state='OPERATING' AND wait IS NOT NULL "
+                "GROUP BY ride_id, 2", (pid,)):
+            slot = hourly.setdefault(rid, [[0, 0] for _ in range(24)])
+            slot[int(hour)] = [round(avg), cnt]
+        summary["hourly"] = hourly
         with open(os.path.join(out_dir, f"{pid}.summary.json"), "w",
                   encoding="utf-8") as fh:
             json.dump(summary, fh, separators=(",", ":"))
@@ -952,7 +832,7 @@ def publish(db: sqlite3.Connection) -> None:
                 "SELECT ts, ride_id, kind, value FROM queues WHERE park_id=? "
                 "AND kind<>'STANDBY' AND value IS NOT NULL ORDER BY ts",
                 (pid,)):
-            day, _ = clock.parts(ts)
+            day = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
             qdays.setdefault(day, {}).setdefault(rid, {}).setdefault(
                 kind, []).append(value)
         qout: dict[str, dict] = {}
@@ -1054,6 +934,7 @@ def main() -> int:
     db = connect()
     refresh_park_list(db)
     last_publish = 0.0
+    last_live_publish = 0.0
     last_backup = 0.0
     last_park_refresh = time.monotonic()
 
@@ -1068,6 +949,16 @@ def main() -> int:
             poll_park(db, park)
         db.commit()
 
+        # Extra sources (queue-times / parkqueuetimes) ride the SAME throttle
+        # and conditional fetch, so they add coverage + a consensus signal
+        # without a second rate budget to reason about. Failures here must
+        # never take down themeparks collection.
+        try:
+            multisource.poll_due_sources(db, fetch, throttle,
+                                         store_raw=STORE_RAW)
+        except Exception as exc:  # noqa: BLE001 — a bad source is not fatal
+            log(f"  ! multisource poll failed: {exc}")
+
         # Schedules ride the same throttle, so they can never crowd out
         # live polling — they just fill idle capacity.
         for pid, sched_etag in db.execute(
@@ -1077,6 +968,20 @@ def main() -> int:
                 break
             poll_schedule(db, pid, sched_etag)
         db.commit()
+
+        # Fast live publish: the small {park}.live.json the app reads, merged
+        # across all sources. Cheap + frequent, separate from the heavy window.
+        if time.monotonic() - last_live_publish > LIVE_PUBLISH_INTERVAL_S:
+            try:
+                n = multisource.publish_live(db, PUBLISH_DIR)
+                if n:
+                    log(f"live published {n} parks")
+                # Showtimes ride the same cadence (cheap: one raw decode per
+                # park); the app's Today screen reads {park}.showtimes.json.
+                multisource.publish_showtimes(db, PUBLISH_DIR)
+            except Exception as exc:  # noqa: BLE001 — must never stop the loop
+                log(f"  ! live publish failed: {exc}")
+            last_live_publish = time.monotonic()
 
         if time.monotonic() - last_publish > PUBLISH_INTERVAL_S:
             try:
