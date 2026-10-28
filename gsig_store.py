@@ -15,9 +15,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 
 import gsig_merge as gm
+
+# Park + attraction ids are themeparks.wiki UUIDs. Constrain them to a
+# path-safe charset BEFORE they are used as a row key or (for `park`) a
+# FILENAME in `publish_all`. The ingest endpoint is unauthenticated, so
+# without this an upload with `p="../../evil"` would let `publish_all` write
+# its `{park}.gsig.json` OUTSIDE the gsig directory (path traversal), and any
+# '/' would spawn arbitrary subdirs. The charset excludes '/', '.', and every
+# separator, so no traversal is expressible; the length bound also caps
+# row-key/table growth from junk ids.
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _valid_id(value):
+    return isinstance(value, str) and _ID_RE.match(value) is not None
 
 _TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS gsig_agg("
@@ -54,9 +69,11 @@ def ingest(conn, record, now=0):
     if not isinstance(record, dict):
         return False
     sig = record.get("sig")
-    if not _valid_sig(sig) or "p" not in record or "a" not in record:
+    park, attr = record.get("p"), record.get("a")
+    # Reject anything that isn't a path-safe id (see _ID_RE) — this is the
+    # unauthenticated write path, so `park`/`attr` are attacker-controlled.
+    if not _valid_sig(sig) or not _valid_id(park) or not _valid_id(attr):
         return False
-    park, attr = record["p"], record["a"]
     row = conn.execute(
         "SELECT data FROM gsig_agg WHERE park=? AND attraction=?",
         (park, attr)).fetchone()
@@ -89,6 +106,11 @@ def publish_all(conn, publish_dir):
 
     written = 0
     for park, rides in by_park.items():
+        # Defensive: `park` becomes a filename below. `ingest` already rejects
+        # non-path-safe ids, but never trust a stored value — skip anything
+        # that could escape `outdir` even if an old row predates that check.
+        if not _valid_id(park):
+            continue
         profiles = []
         for ride in rides:
             published = [c for c in ride.clusters if c.n >= gm.K_MIN]

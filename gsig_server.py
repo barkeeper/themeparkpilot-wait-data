@@ -12,18 +12,54 @@ only). Best-effort: a bad request is rejected, never fatal.
 Deliberately minimal + unauthenticated behind the same trusted tunnel/reverse
 proxy that serves the archive; the payload is capped and validated, and only a
 derived, non-reversible signature is ever accepted (no raw samples exist here).
+The edge gate (``cloudflare/wait-history-gate``) requires a Firebase token and
+caps each uid at 50/day; :class:`IngestLimiter` here is the cheap backstop —
+per client IP per day + a global per-hour ceiling — answering 429.
 """
 from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import gsig_store
 
 
+class IngestLimiter:
+    """Fixed-window counters: per IP per UTC day, and global per hour.
+
+    ponytail: in-memory, so a restart resets the windows; fine for a sanity
+    cap (the per-uid limit lives at the edge). Persist it if that ever matters.
+    """
+
+    def __init__(self, per_ip_daily=500, global_hourly=5000):
+        # 500/IP: a park's guest wifi NATs many phones behind one address.
+        self.per_ip_daily = per_ip_daily
+        self.global_hourly = global_hourly
+        self._lock = threading.Lock()
+        self._day, self._ips = None, {}
+        self._hour, self._global = None, 0
+
+    def allow(self, ip, now=None):
+        now = time.time() if now is None else now
+        day, hour = int(now // 86400), int(now // 3600)
+        with self._lock:
+            if day != self._day:
+                self._day, self._ips = day, {}
+            if hour != self._hour:
+                self._hour, self._global = hour, 0
+            used = self._ips.get(ip, 0)
+            if used >= self.per_ip_daily or self._global >= self.global_hourly:
+                return False
+            self._ips[ip] = used + 1
+            self._global += 1
+            return True
+
+
 class _IngestHandler(BaseHTTPRequestHandler):
     db_path = None  # set by serve()
+    limiter = IngestLimiter()
     protocol_version = "HTTP/1.1"
 
     def _send(self, code, body=b""):
@@ -36,6 +72,13 @@ class _IngestHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802 (http.server API)
         if self.path.rstrip("/") != "/gsig/ingest":
             return self._send(404)
+        # Behind Cloudflare + the tunnel + nginx the socket peer is the proxy;
+        # the edge stamps the real client in CF-Connecting-IP.
+        ip = (self.headers.get("CF-Connecting-IP")
+              or (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+              or self.client_address[0])
+        if not self.limiter.allow(ip):
+            return self._send(429)
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
